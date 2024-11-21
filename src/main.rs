@@ -1,33 +1,40 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-#![allow(rustdoc::missing_crate_level_docs)] // it's an example
-
+//#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 use eframe::egui;
 
-fn main() -> eframe::Result {
-    env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
+#[allow(unused)]
+mod trace;
+
+mod config;
+mod args;
+mod route;
+mod system;
+mod request;
+mod progress;
+
+mod app;
+
+
+
+#[tokio::main]
+async fn main() -> eyre::Result<eframe::Result> {
+    enable_ansi_support::enable_ansi_support()?;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([config::GUI_WIDTH, config::GUI_HEIGHT])
+            .with_resizable(false),
+        multisampling: 2,
+        centered: true,
+
         ..Default::default()
     };
 
-    // Our application state:
-    let mut name = "Arthur".to_owned();
-    let mut age = 42;
-
-    eframe::run_simple_native("My egui App", options, move |ctx, _frame| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("My egui Application");
-            ui.horizontal(|ui| {
-                let name_label = ui.label("Your name: ");
-                ui.text_edit_singleline(&mut name)
-                    .labelled_by(name_label.id);
-            });
-            ui.add(egui::Slider::new(&mut age, 0..=120).text("age"));
-            if ui.button("Increment").clicked() {
-                age += 1;
-            }
-            ui.label(format!("Hello '{name}', age {age}"));
-        });
-    })
+    Ok(eframe::run_native(
+        config::APP_NAME,
+        options,
+        Box::new(|cc| {
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            Ok(Box::new(app::RouteOptimizerApp::new(cc)))
+        }),
+    ))
 }
