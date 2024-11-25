@@ -1,17 +1,13 @@
 use eframe::egui;
+
+use route_optimizer_core::{
+    prelude::*,
+    trace,
+};
+
 use std::sync::{ Arc, RwLock };
 
-use crate::{
-    config,
-    args::Args,
-    route::RouteOption,
-    system::{
-        CurrentShortest,
-        SystemHolder,
-    },
-    progress::ProgressHolder,
-    request::make_requests,
-};
+use crate::config;
 
 
 
@@ -24,6 +20,7 @@ pub struct RouteOptimizerApp {
     concurrent: usize,
 
     result: String,
+    buffer: Arc<RwLock<String>>,
 }
 
 impl RouteOptimizerApp {
@@ -39,11 +36,12 @@ impl RouteOptimizerApp {
 impl eframe::App for RouteOptimizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::global_theme_preference_switch(ui);
-
-            ui.vertical_centered(|ui| ui.label(
-                egui::RichText::new(config::APP_NAME).size(24f32)
-            ));
+            ui.vertical_centered(|ui| {
+                egui::global_theme_preference_buttons(ui);
+                ui.label(
+                    egui::RichText::new(config::APP_NAME).size(24f32)
+                );
+            });
             ui.separator();
 
             ui.label(
@@ -63,9 +61,14 @@ impl eframe::App for RouteOptimizerApp {
                     ui.add_sized(ui.available_size(), egui::TextEdit::singleline(&mut self.end));
                     ui.end_row();
 
+                    ui.label("concurrent");
+                    ui.add_sized(ui.available_size(), egui::Slider::new(&mut self.concurrent, 1..=100));
+                    ui.end_row();
+
                     ui.label("route option");
                     egui::ComboBox::new("arguments_route-option", std::iter::repeat(" ").take(100).collect::<Vec<&str>>().join(""))
                         .selected_text(format!("{}", self.route_option))
+                        .width(ui.available_size().x * 0.8f32)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.route_option, RouteOption::Fastest, "Fastest");
                             ui.selectable_value(&mut self.route_option, RouteOption::Highsec, "Highsec");
@@ -73,16 +76,12 @@ impl eframe::App for RouteOptimizerApp {
                         }
                     );
                     ui.end_row();
-
-                    ui.label("concurrent");
-                    ui.add_sized(ui.available_size(), egui::Slider::new(&mut self.concurrent, 1..=100).text(""));
-                    ui.end_row();
                 });
 
             ui.separator();
 
             if ui.button("calculate").clicked() {
-                let args = Args::builder()
+                let args_result = Args::builder()
                     .set_start(&self.start)
                     .set_route(&self.route)
                     .set_end(&self.end)
@@ -90,51 +89,62 @@ impl eframe::App for RouteOptimizerApp {
                     .set_concurrent(self.concurrent)
                     .build();
 
-                if let Ok(args) = args {
-                    let (current_shortest, progress_holder) = tokio::task::block_in_place(move || {
-                        tokio::runtime::Handle::current().block_on(async move {
-                            calculate(args).await
-                        })
-                    });
-                    self.result = format!("{}\n\n{:#?}", progress_holder.state, current_shortest);
-                } else {
-                    self.result = "Format Error".to_string();
+                match args_result {
+                    Ok(args) => {
+                        let _runner_joinhandle = crossbeam::thread::scope(|s| {
+                            let buffer = self.buffer.clone();
+                            s.spawn(move |_| {
+                                run(args, buffer);
+                            });
+                        });
+                    },
+                    Err(e) => {
+                        self.result = format!("{e}");
+                    },
                 }
             }
 
+            self.result = self.buffer.read().unwrap().to_string();
             ui.add_sized(ui.available_size(), egui::TextEdit::multiline(&mut self.result));
         });
     }
 }
 
-async fn calculate(args: Args) -> (CurrentShortest, ProgressHolder) {
-    // Alloc NEW
-    let mut system_holder = SystemHolder::new();
-    let progress_holder = RwLock::new(ProgressHolder::new());
+fn run(args: Args, buffer: Arc<RwLock<String>>) {
+    let (recv, manager) = RouteOptimizeManager::with_args(args);
+    let joinhandle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .worker_threads(2)
+            .thread_name("RouteOptimizeManager Parallel Runner")
+            .enable_all()
+            .build()
+            .unwrap();
 
-    // Initialize by given `args`
-    system_holder.register_route(&args.route);
-    system_holder.register_system(&args.start);
-    match &args.end {
-        Some(system) => {
-            system_holder.register_system(&system);
-        },
-        _ => (),
-    }
+        let _ = runtime.block_on( async {
+            manager.run().await
+        });
+    });
+    joinhandle.join().unwrap();
 
-    // make inter-system-distance requests
-    make_requests(&args, &system_holder).await;
+    let mut current_shortest: CurrentShortest = CurrentShortest::new();
+    for response in recv.iter() {
+        if let ManagerResponse::Err(_) = response {
+            let mut wlock = buffer.write().unwrap();
+            wlock.clear();
+            wlock.push_str(&trace::string::error(response.to_string()));
+        } else {
+            let mut wlock = buffer.write().unwrap();
+            wlock.clear();
+            wlock.push_str(&trace::string::info(response.to_string()));
+        };
 
-    let calculation_count: u128 = system_holder.permutation_size_hint().unwrap_or(u128::MAX);
-    progress_holder.write().unwrap().set_total(calculation_count);
+        if let ManagerResponse::Ok(returned_current_shortest) = response {
+            current_shortest = returned_current_shortest;
+            break;
+        }
+    };
 
-    let feedback_step: usize = std::cmp::min(1_000_000, std::cmp::max(1, calculation_count/200) as usize);
-    let current_shortest = system_holder.build_shortest_path( &args, &progress_holder, feedback_step );
-
-    let current_shortest = Arc::into_inner(current_shortest).unwrap();
-    let current_shortest = current_shortest.into_inner().unwrap();
-
-    let progress_holder = progress_holder.into_inner().unwrap();
-
-    (current_shortest, progress_holder)
+    let mut wlock = buffer.write().unwrap();
+    wlock.clear();
+    wlock.push_str(&format!("{:?}", current_shortest.to_named()));
 }
